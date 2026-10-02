@@ -1,0 +1,2 @@
+pytest-homeassistant-custom-component==0.13.366
+python-kasa[speedups]==0.10.2

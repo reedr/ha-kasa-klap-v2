@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Make python-kasa log in with KLAP v2 to Kasa plugs and switches whose firmware advertises login version 2 (for example the EP10 on firmware 1.1.1). Without it those devices reject correct TP-Link credentials. Other devices are unaffected."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Already set up."
+    }
+  },
+  "issues": {
+    "incompatible": {
+      "title": "Kasa KLAP v2 can't apply its change",
+      "description": "The installed python-kasa no longer matches what this integration patches, so it does nothing. Check whether Kasa devices with login version 2 connect without it; if they do, remove it."
+    },
+    "not_needed": {
+      "title": "Kasa KLAP v2 is no longer needed",
+      "description": "The installed python-kasa already uses KLAP v2 for devices that advertise login version 2. You can remove this integration."
+    }
+  }
+}

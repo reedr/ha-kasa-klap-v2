@@ -1,0 +1,14 @@
+{
+  "domain": "kasa_klap_v2",
+  "name": "Kasa KLAP v2",
+  "codeowners": ["@reedr"],
+  "config_flow": true,
+  "dependencies": ["tplink"],
+  "documentation": "https://github.com/reedr/ha-kasa-klap-v2",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/reedr/ha-kasa-klap-v2/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "1.0.0"
+}
