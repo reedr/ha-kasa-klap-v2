@@ -37,6 +37,17 @@ and unloading the integration puts python-kasa's own selection back.
 
 TP-Link entries that were waiting to retry are retried as soon as the integration loads.
 
+### Restarts
+
+TP-Link always sets its devices up before this integration, so on every restart the affected devices are first tried
+with KLAP v1 and fail to log in. When that happens TP-Link deletes the device's stored credential hash and asks you to
+re-authenticate. To make restarts recover on their own, this integration keeps its own copy of each TP-Link entry's
+credential hash (in `.storage/kasa_klap_v2.credentials_hashes`). At startup it puts back any hash TP-Link dropped,
+cancels the re-authenticate request, and reloads the entry.
+
+The copy is taken while this integration is running, so it only protects restarts after the device has logged in once
+with it installed.
+
 If the login still fails, the device may hold an old password: it keeps a hash of the account password from its last
 cloud sync. Removing the device from the Kasa app and adding it again refreshes it.
 

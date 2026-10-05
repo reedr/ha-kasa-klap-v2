@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import pytest
 from aiohttp import web
@@ -10,6 +11,7 @@ from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.util import dt as dt_util
 from kasa import (
     AuthenticationError,
     Credentials,
@@ -23,7 +25,10 @@ from kasa.deviceconfig import (
     DeviceFamily,
 )
 from kasa.transports import KlapTransport, KlapTransportV2, XorTransport
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 
 from custom_components.kasa_klap_v2.const import DOMAIN
 from custom_components.kasa_klap_v2.transport import GuardedKlapTransportV2
@@ -197,3 +202,61 @@ async def test_config_flow(hass: HomeAssistant) -> None:
         DOMAIN, context={"source": SOURCE_USER}
     )
     assert result["type"] is FlowResultType.ABORT
+
+
+async def test_backs_up_credential_hashes(hass: HomeAssistant, hass_storage) -> None:
+    """Hashes TP-Link holds are copied to our store, and later changes followed."""
+    plug = MockConfigEntry(
+        domain="tplink",
+        title="EP10",
+        data={"host": "10.0.0.1", "credentials_hash": "aaa"},
+    )
+    plug.add_to_hass(hass)
+    plug.mock_state(hass, ConfigEntryState.LOADED)
+    bare = MockConfigEntry(domain="tplink", title="HS105", data={"host": "10.0.0.2"})
+    bare.add_to_hass(hass)
+    bare.mock_state(hass, ConfigEntryState.LOADED)
+
+    await _setup(hass)
+    assert hass_storage["kasa_klap_v2.credentials_hashes"]["data"] == {
+        plug.entry_id: "aaa"
+    }
+
+    hass.config_entries.async_update_entry(
+        plug, data={**plug.data, "credentials_hash": "bbb"}
+    )
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=5))
+    await hass.async_block_till_done()
+    assert hass_storage["kasa_klap_v2.credentials_hashes"]["data"] == {
+        plug.entry_id: "bbb"
+    }
+
+    assert await hass.config_entries.async_remove(plug.entry_id)
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=10))
+    await hass.async_block_till_done()
+    assert hass_storage["kasa_klap_v2.credentials_hashes"]["data"] == {}
+
+
+async def test_restores_dropped_credential_hash(
+    hass: HomeAssistant, hass_storage
+) -> None:
+    """A hash TP-Link dropped after a failed startup login is put back and retried."""
+    dropped = MockConfigEntry(domain="tplink", title="EP10", data={"host": "10.0.0.1"})
+    dropped.add_to_hass(hass)
+    dropped.mock_state(hass, ConfigEntryState.SETUP_ERROR)
+    fine = MockConfigEntry(domain="tplink", title="KS200", data={"host": "10.0.0.2"})
+    fine.add_to_hass(hass)
+    fine.mock_state(hass, ConfigEntryState.LOADED)
+    hass_storage["kasa_klap_v2.credentials_hashes"] = {
+        "version": 1,
+        "key": "kasa_klap_v2.credentials_hashes",
+        "data": {dropped.entry_id: "aaa", fine.entry_id: "ccc", "gone": "ddd"},
+    }
+
+    reloaded: list[str] = []
+    hass.config_entries.async_schedule_reload = reloaded.append
+    await _setup(hass)
+    assert dropped.data["credentials_hash"] == "aaa"
+    assert "credentials_hash" not in fine.data  # loaded fine; left alone
+    assert reloaded == [dropped.entry_id]
+    assert "gone" not in hass_storage["kasa_klap_v2.credentials_hashes"]["data"]

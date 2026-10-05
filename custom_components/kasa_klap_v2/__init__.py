@@ -15,6 +15,13 @@ python-kasa release with that fix reaches Home Assistant.
 The v2 transport used is ``GuardedKlapTransportV2`` (see ``transport.py``),
 which also logs replies that fail to decrypt and backs off from a plug after
 repeated decrypt failures instead of re-handshaking it on every poll.
+
+TP-Link always sets its devices up before this integration (it is our
+dependency), so at startup the affected devices are tried with KLAP v1 and fail
+authentication. TP-Link then deletes the device's stored credential hash, and
+nothing could log in again without the TP-Link password. To survive that, this
+integration keeps its own copy of every TP-Link entry's credential hash, puts
+it back when TP-Link has dropped it, and reloads the entry.
 """
 
 from __future__ import annotations
@@ -24,11 +31,27 @@ import inspect
 import logging
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry, ConfigEntryState
-from homeassistant.core import HomeAssistant
+from homeassistant.config_entries import (
+    SIGNAL_CONFIG_ENTRY_CHANGED,
+    SOURCE_REAUTH,
+    ConfigEntry,
+    ConfigEntryChange,
+    ConfigEntryState,
+)
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.storage import Store
 
-from .const import DOMAIN, ISSUE_INCOMPATIBLE, ISSUE_NOT_NEEDED
+from .const import (
+    CONF_CREDENTIALS_HASH,
+    DOMAIN,
+    ISSUE_INCOMPATIBLE,
+    ISSUE_NOT_NEEDED,
+    STORAGE_KEY,
+    STORAGE_VERSION,
+    TPLINK_DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -151,12 +174,79 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info(
         "python-kasa now uses KLAP v2 for IOT devices that advertise login version 2"
     )
+    restored = await _async_keep_credential_hashes(hass, entry)
     # TP-Link loads first (it's our dependency), so devices that need the patch
-    # failed once and are waiting to retry; retry them now.
-    for tplink_entry in hass.config_entries.async_entries("tplink"):
-        if tplink_entry.state is ConfigEntryState.SETUP_RETRY:
+    # failed once: retry those waiting to retry, and those whose hash we put back.
+    for tplink_entry in hass.config_entries.async_entries(TPLINK_DOMAIN):
+        if (
+            tplink_entry.state is ConfigEntryState.SETUP_RETRY
+            or tplink_entry.entry_id in restored
+        ):
             hass.config_entries.async_schedule_reload(tplink_entry.entry_id)
     return True
+
+
+async def _async_keep_credential_hashes(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> set[str]:
+    """Back up TP-Link credential hashes, restore dropped ones, and follow changes.
+
+    Returns the TP-Link entry IDs whose hash was put back.
+    """
+    store: Store[dict[str, str]] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+    saved: dict[str, str] = await store.async_load() or {}
+    restored: set[str] = set()
+    for tplink_entry in hass.config_entries.async_entries(TPLINK_DOMAIN):
+        current = tplink_entry.data.get(CONF_CREDENTIALS_HASH)
+        backup = saved.get(tplink_entry.entry_id)
+        if current:
+            saved[tplink_entry.entry_id] = current
+        elif backup and tplink_entry.state in (
+            ConfigEntryState.SETUP_ERROR,
+            ConfigEntryState.SETUP_RETRY,
+        ):
+            _LOGGER.info(
+                "Restoring the credential hash TP-Link dropped for %s",
+                tplink_entry.title,
+            )
+            hass.config_entries.async_update_entry(
+                tplink_entry,
+                data={**tplink_entry.data, CONF_CREDENTIALS_HASH: backup},
+            )
+            # The failed login opened a re-authenticate flow; it is not needed.
+            for flow in hass.config_entries.flow.async_progress_by_handler(
+                TPLINK_DOMAIN,
+                match_context={
+                    "source": SOURCE_REAUTH,
+                    "entry_id": tplink_entry.entry_id,
+                },
+            ):
+                hass.config_entries.flow.async_abort(flow["flow_id"])
+            restored.add(tplink_entry.entry_id)
+    saved = {
+        entry_id: value
+        for entry_id, value in saved.items()
+        if hass.config_entries.async_get_entry(entry_id)
+    }
+    await store.async_save(saved)
+
+    @callback
+    def _changed(change: ConfigEntryChange, changed: ConfigEntry) -> None:
+        if changed.domain != TPLINK_DOMAIN:
+            return
+        if change is ConfigEntryChange.REMOVED:
+            if saved.pop(changed.entry_id, None) is not None:
+                store.async_delay_save(lambda: saved, 1)
+            return
+        current = changed.data.get(CONF_CREDENTIALS_HASH)
+        if current and saved.get(changed.entry_id) != current:
+            saved[changed.entry_id] = current
+            store.async_delay_save(lambda: saved, 1)
+
+    entry.async_on_unload(
+        async_dispatcher_connect(hass, SIGNAL_CONFIG_ENTRY_CHANGED, _changed)
+    )
+    return restored
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
