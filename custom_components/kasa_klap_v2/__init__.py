@@ -11,6 +11,10 @@ This wraps ``kasa.device_factory.get_protocol`` (and the copy ``kasa.discover``
 imported) so those devices get ``KlapTransportV2`` instead, the same change as
 python-kasa PR #1731. Every other device is left alone. Remove it once a
 python-kasa release with that fix reaches Home Assistant.
+
+The v2 transport used is ``GuardedKlapTransportV2`` (see ``transport.py``),
+which also logs replies that fail to decrypt and backs off from a plug after
+repeated decrypt failures instead of re-handshaking it on every poll.
 """
 
 from __future__ import annotations
@@ -83,7 +87,9 @@ def _library_state() -> str:
 def _wrap(original: Any) -> Any:
     from kasa.deviceconfig import DeviceEncryptionType
     from kasa.protocols import IotProtocol
-    from kasa.transports import KlapTransport, KlapTransportV2
+    from kasa.transports import KlapTransport
+
+    from .transport import GuardedKlapTransportV2
 
     @functools.wraps(original)
     def get_protocol(config: Any, *, strict: bool = False) -> Any:
@@ -100,7 +106,7 @@ def _wrap(original: Any) -> Any:
                 config.host,
                 ctype.login_version,
             )
-            return IotProtocol(transport=KlapTransportV2(config=config))
+            return IotProtocol(transport=GuardedKlapTransportV2(config=config))
         return protocol
 
     setattr(get_protocol, _ORIGINAL, original)

@@ -26,6 +26,7 @@ from kasa.transports import KlapTransport, KlapTransportV2, XorTransport
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.kasa_klap_v2.const import DOMAIN
+from custom_components.kasa_klap_v2.transport import GuardedKlapTransportV2
 
 ORIGINAL = device_factory.get_protocol
 CREDS = Credentials("Someone+kasa@example.com", "s3cret!")
@@ -65,7 +66,7 @@ async def test_transport_selection(hass: HomeAssistant) -> None:
 
     entry = await _setup(hass)
     for module in (device_factory, discover):
-        assert _transport(module.get_protocol, v2) is KlapTransportV2
+        assert _transport(module.get_protocol, v2) is GuardedKlapTransportV2
         assert (
             _transport(module.get_protocol, _config(DeviceEncryptionType.Klap, 1))
             is KlapTransport

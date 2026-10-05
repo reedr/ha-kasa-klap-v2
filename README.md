@@ -40,6 +40,21 @@ TP-Link entries that were waiting to retry are retried as soon as the integratio
 If the login still fails, the device may hold an old password: it keeps a hash of the account password from its last
 cloud sync. Removing the device from the Kasa app and adding it again refreshes it.
 
+## Decrypt failures and back-off
+
+EP10s on firmware 1.1.2 Build 260923 can drift into a state where every login succeeds but the reply to the first query
+won't decrypt (`The length of the provided data is not a multiple of the block length`). python-kasa then logs in again
+on the next poll, every few seconds, and the plug gets worse until only a power cycle brings it back.
+
+For the devices it handles, this integration's transport:
+
+- logs a warning describing each reply that won't decrypt (length, block alignment, first bytes, and a text preview
+  if it's printable);
+- leaves the plug alone for 15 s after a decrypt failure, doubling on each consecutive failure up to 10 min, instead
+  of logging in again on every poll. The first good reply clears it.
+
+The plug shows as unavailable during a back-off.
+
 ## When to remove it
 
 Once a python-kasa release with the fix reaches Home Assistant, a repair says the integration is no longer needed. If
