@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from kasa.exceptions import KasaException, _ConnectionError
@@ -100,14 +101,29 @@ def is_session_page(msg: bytes | None) -> bool:
     return bool(msg) and msg.lstrip()[:5].lower() == b"<html"
 
 
+@dataclass
+class PlugHealth:
+    """Decrypt-failure state for one plug.
+
+    Kept per host rather than per transport: Home Assistant builds a new
+    transport for every setup attempt, and a fresh transport must not start a
+    new handshake (and leak another session) while the plug is backed off.
+    """
+
+    failures: int = 0
+    backoff_until: float = 0.0
+    skipped: int = 0
+
+
+_HEALTH: dict[str, PlugHealth] = {}
+
+
 class GuardedKlapTransportV2(KlapTransportV2):
     """KlapTransportV2 that explains decrypt failures and backs off after them."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._decrypt_failures = 0
-        self._backoff_until = 0.0
-        self._skipped = 0
+        self._health = _HEALTH.setdefault(self._host, PlugHealth())
         self._keep_session = False
         self._last_bad_reply: bytes | None = None
 
@@ -133,12 +149,13 @@ class GuardedKlapTransportV2(KlapTransportV2):
         return session
 
     async def send(self, request: str) -> Any:
+        health = self._health
         now = time.monotonic()
-        if now < self._backoff_until:
-            self._skipped += 1
+        if now < health.backoff_until:
+            health.skipped += 1
             raise KasaException(
                 f"Device {self._host} is in decrypt back-off for another "
-                f"{self._backoff_until - now:.0f} s"
+                f"{health.backoff_until - now:.0f} s"
             )
         self._keep_session = False
         self._last_bad_reply = None
@@ -153,14 +170,14 @@ class GuardedKlapTransportV2(KlapTransportV2):
                 raise
             if "Error trying to decrypt" not in str(ex):
                 raise
-            self._decrypt_failures += 1
+            health.failures += 1
             no_session = is_session_page(self._last_bad_reply)
-            wait = backoff_seconds(self._decrypt_failures, no_session)
-            self._backoff_until = time.monotonic() + wait
+            wait = backoff_seconds(health.failures, no_session)
+            health.backoff_until = time.monotonic() + wait
             _LOGGER.warning(
                 "%s: decrypt failure %s in a row%s; not contacting it for %.0f s",
                 self._host,
-                self._decrypt_failures,
+                health.failures,
                 " (generic page: the plug has no session for us, likely out of "
                 "session slots)"
                 if no_session
@@ -168,17 +185,17 @@ class GuardedKlapTransportV2(KlapTransportV2):
                 wait,
             )
             raise
-        if self._decrypt_failures:
+        if health.failures:
             _LOGGER.warning(
                 "%s answered normally again after %s decrypt failures "
                 "(%s polls skipped during back-off)",
                 self._host,
-                self._decrypt_failures,
-                self._skipped,
+                health.failures,
+                health.skipped,
             )
-            self._decrypt_failures = 0
-            self._skipped = 0
-            self._backoff_until = 0.0
+            health.failures = 0
+            health.skipped = 0
+            health.backoff_until = 0.0
         return result
 
     async def reset(self) -> None:

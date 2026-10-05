@@ -76,6 +76,14 @@ class FakePlug:
         return web.Response(body=body)
 
 
+@pytest.fixture(autouse=True)
+def fresh_health():
+    """Back-off state is per host; never carry it between tests."""
+    guarded._HEALTH.clear()
+    yield
+    guarded._HEALTH.clear()
+
+
 @pytest.fixture
 async def plug(aiohttp_server, socket_enabled) -> tuple[FakePlug, int]:
     fake = FakePlug()
@@ -169,7 +177,7 @@ async def test_decrypt_failure_logs_and_backs_off(
         "system": {"get_sysinfo": {}}
     }
     assert "answered normally again after 2 decrypt failures" in caplog.text
-    assert transport._decrypt_failures == 0
+    assert transport._health.failures == 0
     await transport.send('{"system":{"get_sysinfo":{}}}')
     await transport.close()
 
@@ -184,8 +192,8 @@ async def test_other_errors_do_not_back_off(plug) -> None:
     )
     with pytest.raises(KasaException):
         await transport.send('{"system":{"get_sysinfo":{}}}')
-    assert transport._decrypt_failures == 0
-    assert transport._backoff_until == 0.0
+    assert transport._health.failures == 0
+    assert transport._health.backoff_until == 0.0
     await transport.close()
 
 
@@ -204,7 +212,7 @@ async def test_generic_page_backs_off_long(
     assert "text '<html><body><center>200 OK</center></body></html>'" in caplog.text
     assert "generic page" in caplog.text
     assert "not contacting it for 1800 s" in caplog.text
-    assert transport._backoff_until == 1000.0 + 1800
+    assert transport._health.backoff_until == 1000.0 + 1800
 
     # A bad reply still drops the session.
     await transport.reset()
@@ -236,3 +244,25 @@ async def test_timeout_keeps_session(plug) -> None:
     await transport.send('{"system":{"get_sysinfo":{}}}')
     assert fake.handshakes == 2
     await transport.close()
+
+
+async def test_backoff_survives_a_new_transport(
+    plug, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Home Assistant's setup retries build new transports; the back-off holds."""
+    fake, port = plug
+    clock = [1000.0]
+    monkeypatch.setattr(guarded.time, "monotonic", lambda: clock[0])
+    fake.page = True
+    first = _transport(port)
+    with pytest.raises(KasaException, match="Error trying to decrypt"):
+        await first.send('{"system":{"get_sysinfo":{}}}')
+    await first.close()
+    assert fake.handshakes == 1
+
+    clock[0] += 60
+    second = _transport(port)
+    with pytest.raises(KasaException, match="back-off"):
+        await second.send('{"system":{"get_sysinfo":{}}}')
+    assert fake.handshakes == 1
+    await second.close()
