@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -22,9 +23,12 @@ from custom_components.kasa_klap_v2.transport import (
     GuardedKlapTransportV2,
     backoff_seconds,
     describe_response,
+    is_network_error,
+    is_session_page,
 )
 
 CREDS = Credentials("Someone+kasa@example.com", "s3cret!")
+SESSION_PAGE = b"<html><body><center>200 OK</center></body></html>"
 
 
 class FakePlug:
@@ -35,6 +39,8 @@ class FakePlug:
         self.remote_seed = os.urandom(16)
         self.local_seed = b""
         self.broken = True
+        self.page = False
+        self.delay = 0.0
         self.handshakes = 0
         self.requests = 0
 
@@ -55,6 +61,10 @@ class FakePlug:
     async def query(self, request: web.Request) -> web.Response:
         self.requests += 1
         await request.read()
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.page:
+            return web.Response(body=SESSION_PAGE)
         if self.broken:
             # 32-byte signature plus a ciphertext that is not block aligned.
             return web.Response(body=os.urandom(32) + b"\x01\x02\x03\x04\x05")
@@ -77,11 +87,12 @@ async def plug(aiohttp_server, socket_enabled) -> tuple[FakePlug, int]:
     return fake, server.port
 
 
-def _transport(port: int) -> GuardedKlapTransportV2:
+def _transport(port: int, timeout: float | None = None) -> GuardedKlapTransportV2:
     return GuardedKlapTransportV2(
         config=DeviceConfig(
             host="127.0.0.1",
             port_override=port,
+            timeout=timeout or 5,
             credentials=CREDS,
             connection_type=DeviceConnectionParameters(
                 DeviceFamily.IotSmartPlugSwitch,
@@ -95,6 +106,24 @@ def _transport(port: int) -> GuardedKlapTransportV2:
 def test_backoff_schedule() -> None:
     assert backoff_seconds(0) == 0
     assert [backoff_seconds(n) for n in range(1, 8)] == [15, 30, 60, 120, 240, 480, 600]
+    assert [backoff_seconds(n, no_session=True) for n in range(1, 4)] == [
+        1800,
+        3600,
+        3600,
+    ]
+
+
+def test_is_network_error() -> None:
+    assert is_network_error(TimeoutError("timed out"))
+    assert is_network_error(KasaException("Unable to query the device: x: ", None))
+    assert not is_network_error(KasaException("Error trying to decrypt device x"))
+    assert not is_network_error(KasaException("Device x responded with 500"))
+
+
+def test_is_session_page() -> None:
+    assert is_session_page(SESSION_PAGE)
+    assert not is_session_page(bytes(49))
+    assert not is_session_page(None)
 
 
 def test_describe_response() -> None:
@@ -157,4 +186,53 @@ async def test_other_errors_do_not_back_off(plug) -> None:
         await transport.send('{"system":{"get_sysinfo":{}}}')
     assert transport._decrypt_failures == 0
     assert transport._backoff_until == 0.0
+    await transport.close()
+
+
+async def test_generic_page_backs_off_long(
+    plug, caplog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The plug's generic page means no session for us: wait 30 minutes."""
+    fake, port = plug
+    clock = [1000.0]
+    monkeypatch.setattr(guarded.time, "monotonic", lambda: clock[0])
+    fake.page = True
+    transport = _transport(port)
+    caplog.set_level(logging.WARNING, logger=guarded.__name__)
+    with pytest.raises(KasaException, match="Error trying to decrypt"):
+        await transport.send('{"system":{"get_sysinfo":{}}}')
+    assert "text '<html><body><center>200 OK</center></body></html>'" in caplog.text
+    assert "generic page" in caplog.text
+    assert "not contacting it for 1800 s" in caplog.text
+    assert transport._backoff_until == 1000.0 + 1800
+
+    # A bad reply still drops the session.
+    await transport.reset()
+    assert not transport._handshake_done
+    await transport.close()
+
+
+@pytest.mark.parametrize("expected_lingering_timers", [True])
+async def test_timeout_keeps_session(plug) -> None:
+    """A timed-out query keeps the session, so the retry does not re-handshake."""
+    fake, port = plug
+    fake.broken = False
+    transport = _transport(port, timeout=0.3)
+    await transport.send('{"system":{"get_sysinfo":{}}}')
+    assert fake.handshakes == 1
+
+    fake.delay = 1.0
+    with pytest.raises((TimeoutError, KasaException), match="Unable to query"):
+        await transport.send('{"system":{"get_sysinfo":{}}}')
+    await transport.reset()  # what IotProtocol does after a timeout
+    assert transport._handshake_done
+
+    fake.delay = 0
+    await transport.send('{"system":{"get_sysinfo":{}}}')
+    assert fake.handshakes == 1
+
+    # A plain reset (any other error) still drops it.
+    await transport.reset()
+    await transport.send('{"system":{"get_sysinfo":{}}}')
+    assert fake.handshakes == 2
     await transport.close()

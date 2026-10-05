@@ -57,12 +57,19 @@ EP10s on firmware 1.1.2 Build 260923 can drift into a state where every login su
 won't decrypt (`The length of the provided data is not a multiple of the block length`). python-kasa then logs in again
 on the next poll, every few seconds, and the plug gets worse until only a power cycle brings it back.
 
+What the plug sends back is its generic web page, `<html><body><center>200 OK</center></body></html>`: it no longer
+recognises the session it just agreed to. The likely cause is session exhaustion. Every login creates a session on the
+plug that lasts 24 hours, and python-kasa logs in again after any timeout, so each Wi-Fi blip leaks a session.
+
 For the devices it handles, this integration's transport:
 
+- keeps the session after a timeout or connection error instead of logging in again, so blips don't leak sessions;
+  a 403, an expired session or a bad reply still starts a new one;
 - logs a warning describing each reply that won't decrypt (length, block alignment, first bytes, and a text preview
   if it's printable);
 - leaves the plug alone for 15 s after a decrypt failure, doubling on each consecutive failure up to 10 min, instead
-  of logging in again on every poll. The first good reply clears it.
+  of logging in again on every poll. When the reply is the generic page it waits 30 min, then 60 min, so old sessions
+  can expire. The first good reply clears it.
 
 The plug shows as unavailable during a back-off.
 
