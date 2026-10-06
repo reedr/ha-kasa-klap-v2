@@ -40,6 +40,7 @@ class FakePlug:
         self.local_seed = b""
         self.broken = True
         self.page = False
+        self.page_next = 0  # answer this many queries with the page, then recover
         self.delay = 0.0
         self.handshakes = 0
         self.requests = 0
@@ -63,7 +64,8 @@ class FakePlug:
         await request.read()
         if self.delay:
             await asyncio.sleep(self.delay)
-        if self.page:
+        if self.page or self.page_next > 0:
+            self.page_next = max(0, self.page_next - 1)
             return web.Response(body=SESSION_PAGE)
         if self.broken:
             # 32-byte signature plus a ciphertext that is not block aligned.
@@ -210,8 +212,9 @@ async def test_generic_page_backs_off_long(
     with pytest.raises(KasaException, match="Error trying to decrypt"):
         await transport.send('{"system":{"get_sysinfo":{}}}')
     assert "text '<html><body><center>200 OK</center></body></html>'" in caplog.text
-    assert "generic page" in caplog.text
+    assert "generic page on a fresh session" in caplog.text
     assert "not contacting it for 1800 s" in caplog.text
+    assert fake.handshakes == 1
     assert transport._health.backoff_until == 1000.0 + 1800
 
     # A bad reply still drops the session.
@@ -266,3 +269,44 @@ async def test_backoff_survives_a_new_transport(
         await second.send('{"system":{"get_sysinfo":{}}}')
     assert fake.handshakes == 1
     await second.close()
+
+
+async def test_dropped_session_logs_in_again(plug, caplog) -> None:
+    """A working session the plug drops gets one new login, with no back-off."""
+    fake, port = plug
+    fake.broken = False
+    transport = _transport(port)
+    caplog.set_level(logging.WARNING, logger=guarded.__name__)
+    await transport.send('{"system":{"get_sysinfo":{}}}')
+    assert fake.handshakes == 1
+
+    fake.page_next = 1
+    assert await transport.send('{"system":{"get_sysinfo":{}}}') == {
+        "system": {"get_sysinfo": {}}
+    }
+    assert fake.handshakes == 2
+    assert "dropped our KLAP session" in caplog.text
+    assert transport._health.failures == 0
+    assert transport._health.backoff_until == 0.0
+    await transport.close()
+
+
+async def test_page_after_new_login_backs_off(
+    plug, caplog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the fresh login also gets the page, the plug is stuck: back off long."""
+    fake, port = plug
+    clock = [1000.0]
+    monkeypatch.setattr(guarded.time, "monotonic", lambda: clock[0])
+    fake.broken = False
+    transport = _transport(port)
+    caplog.set_level(logging.WARNING, logger=guarded.__name__)
+    await transport.send('{"system":{"get_sysinfo":{}}}')
+
+    fake.page = True
+    with pytest.raises(KasaException, match="Error trying to decrypt"):
+        await transport.send('{"system":{"get_sysinfo":{}}}')
+    assert fake.handshakes == 2  # one retry only
+    assert "page on a fresh session" in caplog.text
+    assert transport._health.backoff_until == 1000.0 + 1800
+    await transport.close()

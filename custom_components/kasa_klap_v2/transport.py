@@ -22,6 +22,11 @@ This transport adds, on top of ``KlapTransportV2``:
 * diagnostics: when a reply fails to decrypt, it logs what the plug actually
   sent (length, block alignment, the first bytes in hex, and a text preview if
   it is printable);
+* dropped sessions: the plug also answers with the generic page when it has
+  silently dropped a session that was working (seen 2026-10-06: the Theater
+  Marquee, after a quiet night). That needs one new login, not a back-off, so a
+  page on a session that has already worked triggers one immediate re-login and
+  retry. Only a page on a brand-new session counts as a stuck plug;
 * back-off: after consecutive decrypt failures it refuses to contact the plug
   for an exponentially growing interval instead of re-handshaking on every
   poll. When the reply is the generic page the wait starts at 30 minutes, so
@@ -126,6 +131,16 @@ class GuardedKlapTransportV2(KlapTransportV2):
         self._health = _HEALTH.setdefault(self._host, PlugHealth())
         self._keep_session = False
         self._last_bad_reply: bytes | None = None
+        # Whether the current session has produced a good reply, and its history.
+        self._session_good = False
+        self._session_started = 0.0
+        self._session_replies = 0
+
+    async def perform_handshake(self) -> None:
+        await super().perform_handshake()
+        self._session_good = False
+        self._session_started = time.monotonic()
+        self._session_replies = 0
 
     async def perform_handshake2(self, *args: Any, **kwargs: Any) -> Any:
         session = await super().perform_handshake2(*args, **kwargs)
@@ -157,34 +172,51 @@ class GuardedKlapTransportV2(KlapTransportV2):
                 f"Device {self._host} is in decrypt back-off for another "
                 f"{health.backoff_until - now:.0f} s"
             )
-        self._keep_session = False
-        self._last_bad_reply = None
-        try:
-            result = await super().send(request)
-        except (TimeoutError, KasaException) as ex:
-            if is_network_error(ex):
-                # Network trouble says nothing about the session; keep it so the
-                # retry does not leak another one on the plug.
-                if self._handshake_done and not self._handshake_session_expired():
-                    self._keep_session = True
+        for attempt in (1, 2):
+            self._keep_session = False
+            self._last_bad_reply = None
+            try:
+                result = await super().send(request)
+                break
+            except (TimeoutError, KasaException) as ex:
+                if is_network_error(ex):
+                    # Network trouble says nothing about the session; keep it so
+                    # the retry does not leak another one on the plug.
+                    if self._handshake_done and not self._handshake_session_expired():
+                        self._keep_session = True
+                    raise
+                if "Error trying to decrypt" not in str(ex):
+                    raise
+                no_session = is_session_page(self._last_bad_reply)
+                if no_session and attempt == 1 and self._session_good:
+                    # The plug dropped a session that had been working (it
+                    # expires them sooner than its TIMEOUT cookie says). One new
+                    # login fixes that; no back-off.
+                    _LOGGER.warning(
+                        "%s dropped our KLAP session after %.0f min and %s good "
+                        "replies; logging in again",
+                        self._host,
+                        (time.monotonic() - self._session_started) / 60,
+                        self._session_replies,
+                    )
+                    self._handshake_done = False
+                    continue
+                health.failures += 1
+                wait = backoff_seconds(health.failures, no_session)
+                health.backoff_until = time.monotonic() + wait
+                _LOGGER.warning(
+                    "%s: decrypt failure %s in a row%s; not contacting it for %.0f s",
+                    self._host,
+                    health.failures,
+                    " (generic page on a fresh session: the plug has no room "
+                    "for us, likely out of session slots)"
+                    if no_session
+                    else "",
+                    wait,
+                )
                 raise
-            if "Error trying to decrypt" not in str(ex):
-                raise
-            health.failures += 1
-            no_session = is_session_page(self._last_bad_reply)
-            wait = backoff_seconds(health.failures, no_session)
-            health.backoff_until = time.monotonic() + wait
-            _LOGGER.warning(
-                "%s: decrypt failure %s in a row%s; not contacting it for %.0f s",
-                self._host,
-                health.failures,
-                " (generic page: the plug has no session for us, likely out of "
-                "session slots)"
-                if no_session
-                else "",
-                wait,
-            )
-            raise
+        self._session_good = True
+        self._session_replies += 1
         if health.failures:
             _LOGGER.warning(
                 "%s answered normally again after %s decrypt failures "

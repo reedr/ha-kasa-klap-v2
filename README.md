@@ -67,6 +67,8 @@ For the devices it handles, this integration's transport:
   a 403, an expired session or a bad reply still starts a new one;
 - logs a warning describing each reply that won't decrypt (length, block alignment, first bytes, and a text preview
   if it's printable);
+- logs in again and retries once, immediately, when the generic page comes back on a session that had been working
+  (the plug sometimes drops sessions early); only a generic page on a brand-new session counts as a stuck plug;
 - leaves the plug alone for 15 s after a decrypt failure, doubling on each consecutive failure up to 10 min, instead
   of logging in again on every poll. When the reply is the generic page it waits 30 min, then 60 min, so old sessions
   can expire. The first good reply clears it.
